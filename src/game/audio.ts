@@ -249,4 +249,78 @@ export class LanternAudio {
       osc.stop(t + 0.27);
     });
   }
+
+  public playPowerActivate(): void {
+    const ctx = this.getReadyCtx();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    [440, 659.25, 880].forEach((freq, i) => {
+      const t = now + i * 0.035;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freq, t);
+      osc.frequency.exponentialRampToValueAtTime(freq * 1.1, t + 0.18);
+      gain.gain.setValueAtTime(0.001, t);
+      gain.gain.linearRampToValueAtTime(0.11, t + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.24);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.26);
+    });
+  }
+
+  public playCandleShoot(): void {
+    const ctx = this.getReadyCtx();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    const jitter = 0.94 + Math.random() * 0.12;
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(520 * jitter, now);
+    osc.frequency.exponentialRampToValueAtTime(220 * jitter, now + 0.11);
+
+    gain.gain.setValueAtTime(0.001, now);
+    gain.gain.linearRampToValueAtTime(0.09, now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.13);
+  }
+
+  public playEliminateObstacle(): void {
+    const ctx = this.getReadyCtx();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const chime = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(280, now);
+    osc.frequency.exponentialRampToValueAtTime(110, now + 0.16);
+
+    chime.type = 'triangle';
+    chime.frequency.setValueAtTime(740, now);
+    chime.frequency.exponentialRampToValueAtTime(1110, now + 0.15);
+
+    gain.gain.setValueAtTime(0.001, now);
+    gain.gain.linearRampToValueAtTime(0.13, now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
+
+    osc.connect(gain);
+    chime.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    chime.start(now);
+    osc.stop(now + 0.19);
+    chime.stop(now + 0.19);
+  }
 }

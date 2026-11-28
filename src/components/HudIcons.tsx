@@ -135,7 +135,7 @@ export const MiniLanternPreview: React.FC<{ color: LanternColorDef; size?: numbe
 }) => (
   <svg width={size} height={size} viewBox="0 0 48 48" fill="none" aria-hidden="true">
     <circle cx="24" cy="24" r="21" fill={color.glowRgba} />
-    {color.hasShield && (
+    {color.powerType === 'shield' && (
       <circle
         cx="24"
         cy="24"
@@ -145,7 +145,7 @@ export const MiniLanternPreview: React.FC<{ color: LanternColorDef; size?: numbe
         strokeOpacity="0.85"
       />
     )}
-    {color.hasMagnet && (
+    {color.powerType === 'magnet' && (
       <path
         d="M 8 18 A 18 18 0 0 1 40 18"
         stroke={color.accentHex}
@@ -154,11 +154,36 @@ export const MiniLanternPreview: React.FC<{ color: LanternColorDef; size?: numbe
         strokeOpacity="0.9"
       />
     )}
+    {color.powerType === 'time_slow' && (
+      <circle
+        cx="24"
+        cy="24"
+        r="19.5"
+        stroke={color.accentHex}
+        strokeWidth="1.4"
+        strokeDasharray="2 4"
+        strokeOpacity="0.9"
+      />
+    )}
+    {color.powerType === 'sky_net' && (
+      <>
+        <circle cx="10" cy="12" r="2.2" fill="#fef08a" />
+        <circle cx="38" cy="12" r="2.2" fill="#fef08a" />
+      </>
+    )}
+    {color.powerType === 'candle_shot' && (
+      <path
+        d="M24 2.5C26.5 5.8 26.5 8 24 9.5C21.5 8 21.5 5.8 24 2.5Z"
+        fill="#fef08a"
+        stroke="#fb923c"
+        strokeWidth="0.9"
+      />
+    )}
     <rect
       x="16.5"
-      y="7"
+      y="9"
       width="15"
-      height="4"
+      height="3.8"
       rx="1.6"
       fill="#1e1b2e"
       stroke={color.trimColor}
@@ -166,27 +191,27 @@ export const MiniLanternPreview: React.FC<{ color: LanternColorDef; size?: numbe
     />
     <ellipse
       cx="24"
-      cy="23.5"
-      rx="12"
-      ry="14"
+      cy="24.5"
+      rx="11.5"
+      ry="13.2"
       fill={color.accentHex}
       stroke="#0f172a"
       strokeWidth="1.4"
-      fillOpacity={color.hasGhost ? 0.82 : 1}
+      fillOpacity={color.powerType === 'ghost' ? 0.8 : 1}
     />
-    <ellipse cx="24" cy="23.5" rx="5.5" ry="13.5" stroke="#0f172a" strokeOpacity="0.3" strokeWidth="1.1" />
-    <polygon points="24,17 27.5,23.5 24,30 20.5,23.5" fill={color.bodyCore} />
+    <ellipse cx="24" cy="24.5" rx="5.2" ry="12.6" stroke="#0f172a" strokeOpacity="0.3" strokeWidth="1.1" />
+    <polygon points="24,18.5 27.2,24.5 24,30.5 20.8,24.5" fill={color.bodyCore} />
     <rect
       x="17.5"
-      y="36.5"
+      y="36.8"
       width="13"
-      height="3.6"
+      height="3.4"
       rx="1.4"
       fill="#1e1b2e"
       stroke={color.trimColor}
       strokeWidth="1.2"
     />
-    <line x1="24" y1="40.1" x2="24" y2="45.5" stroke={color.accentHex} strokeWidth="2" strokeLinecap="round" />
+    <line x1="24" y1="40.2" x2="24" y2="45.5" stroke={color.accentHex} strokeWidth="2" strokeLinecap="round" />
   </svg>
 );
 

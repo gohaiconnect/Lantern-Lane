@@ -134,6 +134,11 @@ export const ShopModal: React.FC<ShopModalProps> = ({
                         <span className="text-xs font-medium text-amber-300/90">
                           {item.powerName}
                         </span>
+                        {item.powerDurationSec > 0 && (
+                          <span className="text-[11px] font-mono-num text-amber-100/55">
+                            · {item.powerDurationSec.toFixed(1)}s active / {item.powerCooldownSec.toFixed(1)}s cd
+                          </span>
+                        )}
                       </div>
                       <p className="text-xs sm:text-sm text-amber-100/70 mt-0.5 leading-snug">
                         {item.powerSummary}

@@ -79,7 +79,7 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
 
       {/* Single flat, borderless control-hint line in bottom safe margin */}
       <div className="text-xs sm:text-[13px] text-amber-100/70 tracking-wide text-center hud-stroke">
-        ← / → or A / D or Drag to Slide · Space Ghost Power · Esc Pause · M Mute
+        WASD / Arrows or Drag to Glide · Space Activate Power · Esc Pause · M Mute
       </div>
     </div>
   );

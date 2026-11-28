@@ -1,20 +1,34 @@
 import { LanternAudio } from './audio';
 import { LANTERN_COLOR_MAP } from './catalog';
 import {
+  TIME_SLOW_FACTOR,
+  activatePowerTimer,
   applyLevelClearHeartReward,
   circlesOverlap,
+  clampPlayerPosition,
   computeMagnetPull,
+  createInitialPowerTimer,
+  getEffectiveFallSpeedMultiplier,
   getGoldValueForCatch,
   getLevelClearBonusGold,
   getLevelDurationSec,
   getLevelSpeedMultiplier,
+  getNebulaIntensityForSpeed,
+  getNebulaLayerWeights,
   getPaceZone,
+  getPlayerVerticalBounds,
   getPurpleRatio,
   getSpawnIntervalSec,
   getStartingHearts,
+  normalizeMoveVector,
+  resolveProjectileHit,
   resolvePurpleHit,
+  stepNebulaIntensity,
+  tickPowerTimer,
 } from './rules';
+import type { PowerTimerSnapshot } from './rules';
 import type {
+  CandleProjectile,
   FallingLantern,
   GamePhase,
   HudSnapshot,
@@ -79,8 +93,8 @@ export interface EngineCallbacks {
   onPhaseChange: (phase: GamePhase) => void;
 }
 
-const PARTICLE_POOL_SIZE = 180;
-const FLOATING_TEXT_POOL_SIZE = 24;
+const PARTICLE_POOL_SIZE = 200;
+const FLOATING_TEXT_POOL_SIZE = 28;
 const STAR_COUNT = 120;
 const AMBIENT_COUNT = 14;
 const PLAYER_RADIUS = 24;
@@ -108,8 +122,11 @@ export class LanternLaneEngine {
   private callbacks: EngineCallbacks;
   private progress: PersistentProgress;
 
-  // Pre-rendered offscreen caches to avoid heavy per-frame radial gradients
-  private bgCanvas: HTMLCanvasElement;
+  // Pre-rendered offscreen caches for silky zero-GC nebula color cross-fading
+  private bgCalmCanvas: HTMLCanvasElement;
+  private bgMidCanvas: HTMLCanvasElement;
+  private bgPeakCanvas: HTMLCanvasElement;
+  private nebulaIntensity = 0;
   private glowStamps: Record<string, HTMLCanvasElement> = {};
 
   private width = 1280;
@@ -140,22 +157,25 @@ export class LanternLaneEngine {
   private levelElapsed = 0;
   private levelDuration = 26;
   private spawnTimer = 0.8;
-  private nextLanternId = 1;
+  private nextEntityId = 1;
   private worldTime = 0;
 
-  // Player state
+  // Player state (2D movement within lower half of screen)
   private playerX = 640;
   private playerY = 600;
   private playerVx = 0;
+  private playerVy = 0;
   private playerTilt = 0;
   private squashX = 1;
   private squashY = 1;
   private invulnTimer = 0;
   private hitFlashTimer = 0;
-  private shieldCharge = 1;
-  private ghostActiveTimer = 0;
-  private ghostCooldownTimer = 0;
-  private ghostBufferTimer = 0;
+
+  // Unified duration-limited active power state
+  private powerTimer: PowerTimerSnapshot;
+  private powerBufferTimer = 0;
+  private powerFireCooldown = 0;
+
   private defeatDelayTimer = 0;
   private pendingDefeat = false;
 
@@ -167,6 +187,7 @@ export class LanternLaneEngine {
 
   // Entities & Pools (Zero-GC ring buffers)
   private falling: FallingLantern[] = [];
+  private projectiles: CandleProjectile[] = [];
   private stars: Star[] = [];
   private ambient: AmbientLantern[] = [];
   private particles: PooledParticle[] = [];
@@ -179,6 +200,7 @@ export class LanternLaneEngine {
   private keysHeld = new Set<string>();
   private pointerActive = false;
   private pointerTargetX: number | null = null;
+  private pointerTargetY: number | null = null;
   private titleHoverX: number | null = null;
 
   constructor(
@@ -196,14 +218,16 @@ export class LanternLaneEngine {
     this.audio = audio;
     this.callbacks = callbacks;
     this.progress = initialProgress;
-    this.bgCanvas = document.createElement('canvas');
+    this.powerTimer = createInitialPowerTimer(initialProgress.equippedColor);
+    this.bgCalmCanvas = document.createElement('canvas');
+    this.bgMidCanvas = document.createElement('canvas');
+    this.bgPeakCanvas = document.createElement('canvas');
 
     this.initGlowStamps();
     this.initPools();
     this.handleResize();
     this.initScenery();
-    this.playerX = this.width * 0.5;
-    this.playerY = this.height - Math.max(92, this.height * 0.14);
+    this.resetPlayerToStartPosition();
     this.hearts = getStartingHearts(this.progress);
     this.maxHearts = this.hearts;
 
@@ -211,6 +235,15 @@ export class LanternLaneEngine {
     this.emitHud(true);
     this.render();
     this.startLoop();
+  }
+
+  private resetPlayerToStartPosition(): void {
+    const { minY, maxY } = getPlayerVerticalBounds(this.height, PLAYER_RADIUS);
+    this.playerX = this.width * 0.5;
+    this.playerY = Math.max(minY, Math.min(maxY, this.height - Math.max(92, this.height * 0.14)));
+    this.playerVx = 0;
+    this.playerVy = 0;
+    this.playerTilt = 0;
   }
 
   private initGlowStamps(): void {
@@ -223,37 +256,79 @@ export class LanternLaneEngine {
       cobalt: createGlowStamp('rgba(56, 189, 248, 0.48)', 'rgba(56, 189, 248, 0)'),
       emerald: createGlowStamp('rgba(52, 211, 153, 0.48)', 'rgba(52, 211, 153, 0)'),
       pearl: createGlowStamp('rgba(226, 232, 240, 0.48)', 'rgba(226, 232, 240, 0)'),
+      candle: createGlowStamp('rgba(251, 146, 60, 0.52)', 'rgba(234, 88, 12, 0)'),
+      prism: createGlowStamp('rgba(250, 204, 21, 0.5)', 'rgba(202, 138, 4, 0)'),
+      frost: createGlowStamp('rgba(34, 211, 238, 0.5)', 'rgba(8, 145, 178, 0)'),
       crimson: createGlowStamp('rgba(251, 113, 133, 0.48)', 'rgba(251, 113, 133, 0)'),
     };
   }
 
-  private rebuildBackdropCache(): void {
+  private renderNebulaBackdrop(
+    target: HTMLCanvasElement,
+    skyStops: [string, string, string],
+    clouds: Array<{ x: number; y: number; r: number; color: string }>
+  ): void {
     const w = this.width;
     const h = this.height;
-    this.bgCanvas.width = w;
-    this.bgCanvas.height = h;
-    const bctx = this.bgCanvas.getContext('2d');
+    target.width = w;
+    target.height = h;
+    const bctx = target.getContext('2d');
     if (!bctx) return;
 
     const sky = bctx.createLinearGradient(0, 0, 0, h);
-    sky.addColorStop(0, '#060816');
-    sky.addColorStop(0.48, '#0b1028');
-    sky.addColorStop(1, '#121633');
+    sky.addColorStop(0, skyStops[0]);
+    sky.addColorStop(0.5, skyStops[1]);
+    sky.addColorStop(1, skyStops[2]);
     bctx.fillStyle = sky;
     bctx.fillRect(0, 0, w, h);
 
-    const drawNebula = (x: number, y: number, radius: number, color: string) => {
-      const grad = bctx.createRadialGradient(x, y, 0, x, y, radius);
-      grad.addColorStop(0, color);
+    const m = Math.min(w, h);
+    for (let i = 0; i < clouds.length; i++) {
+      const c = clouds[i];
+      const cx = w * c.x;
+      const cy = h * c.y;
+      const radius = m * c.r;
+      const grad = bctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+      grad.addColorStop(0, c.color);
       grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
       bctx.fillStyle = grad;
-      bctx.fillRect(x - radius, y - radius, radius * 2, radius * 2);
-    };
+      bctx.fillRect(cx - radius, cy - radius, radius * 2, radius * 2);
+    }
+  }
 
-    const m = Math.min(w, h);
-    drawNebula(w * 0.22, h * 0.28, m * 0.45, 'rgba(245, 158, 11, 0.06)');
-    drawNebula(w * 0.78, h * 0.62, m * 0.42, 'rgba(99, 102, 241, 0.07)');
-    drawNebula(w * 0.5, h * 0.88, m * 0.36, 'rgba(251, 191, 36, 0.05)');
+  private rebuildBackdropCache(): void {
+    // 1. Calm / Easing Nebula: deep midnight sapphire with quiet cerulean & warm starlight dust
+    this.renderNebulaBackdrop(
+      this.bgCalmCanvas,
+      ['#050816', '#0a112b', '#10193a'],
+      [
+        { x: 0.22, y: 0.26, r: 0.48, color: 'rgba(56, 189, 248, 0.085)' },
+        { x: 0.78, y: 0.62, r: 0.46, color: 'rgba(99, 102, 241, 0.095)' },
+        { x: 0.5, y: 0.88, r: 0.4, color: 'rgba(251, 191, 36, 0.05)' },
+      ]
+    );
+
+    // 2. Brisk / Rising Nebula: rich cosmic indigo & royal amethyst with luminous gold wisps
+    this.renderNebulaBackdrop(
+      this.bgMidCanvas,
+      ['#09071c', '#140f36', '#1e1545'],
+      [
+        { x: 0.25, y: 0.3, r: 0.52, color: 'rgba(139, 92, 246, 0.14)' },
+        { x: 0.76, y: 0.56, r: 0.5, color: 'rgba(245, 158, 11, 0.11)' },
+        { x: 0.48, y: 0.85, r: 0.44, color: 'rgba(192, 132, 252, 0.095)' },
+      ]
+    );
+
+    // 3. Peak Surge / High-Level Nebula: radiant starforge crimson-violet & sunset amber glow
+    this.renderNebulaBackdrop(
+      this.bgPeakCanvas,
+      ['#11071b', '#220d31', '#2c1330'],
+      [
+        { x: 0.2, y: 0.28, r: 0.56, color: 'rgba(244, 63, 94, 0.17)' },
+        { x: 0.78, y: 0.48, r: 0.54, color: 'rgba(251, 146, 60, 0.16)' },
+        { x: 0.5, y: 0.82, r: 0.5, color: 'rgba(192, 38, 211, 0.13)' },
+      ]
+    );
   }
 
   public setModalOpen(open: boolean): void {
@@ -271,7 +346,14 @@ export class LanternLaneEngine {
 
   public syncProgress(next: PersistentProgress): void {
     const prevExtra = this.progress.helpers.extra_heart;
+    const colorChanged = this.progress.equippedColor !== next.equippedColor;
     this.progress = next;
+
+    if (colorChanged) {
+      this.powerTimer = createInitialPowerTimer(next.equippedColor);
+      this.powerFireCooldown = 0;
+    }
+
     const newStarting = getStartingHearts(next);
     if (next.helpers.extra_heart > prevExtra) {
       const gained = next.helpers.extra_heart - prevExtra;
@@ -296,11 +378,12 @@ export class LanternLaneEngine {
     return muted;
   }
 
-  public triggerGhostPower(): void {
+  public triggerActivePower(): void {
     if (this.phase !== 'playing' || this.pendingDefeat) return;
     const colorDef = LANTERN_COLOR_MAP[this.progress.equippedColor];
-    if (!colorDef.hasGhost) return;
-    this.ghostBufferTimer = 0.14;
+    if (colorDef.powerType === 'none') return;
+    this.audio.unlock();
+    this.powerBufferTimer = 0.14;
   }
 
   public startNewRun(fromUserGesture = true): void {
@@ -310,6 +393,7 @@ export class LanternLaneEngine {
     this.keysHeld.clear();
     this.pointerActive = false;
     this.pointerTargetX = null;
+    this.pointerTargetY = null;
     this.level = 1;
     this.maxHearts = getStartingHearts(this.progress);
     this.hearts = this.maxHearts;
@@ -324,12 +408,13 @@ export class LanternLaneEngine {
     this.keysHeld.clear();
     this.pointerActive = false;
     this.pointerTargetX = null;
+    this.pointerTargetY = null;
     this.callbacks.onRunSummary(null);
     this.beginLevel(this.level + 1);
   }
 
   public restartCurrentRun(): void {
-    this.startNewRun();
+    this.startNewRun(true);
   }
 
   public pause(): void {
@@ -355,11 +440,14 @@ export class LanternLaneEngine {
     this.keysHeld.clear();
     this.pointerActive = false;
     this.pointerTargetX = null;
+    this.pointerTargetY = null;
     this.falling = [];
+    this.projectiles = [];
     this.pendingDefeat = false;
     this.defeatDelayTimer = 0;
     this.maxHearts = getStartingHearts(this.progress);
     this.hearts = this.maxHearts;
+    this.resetPlayerToStartPosition();
     this.callbacks.onRunSummary(null);
     this.pausedRenderedOnce = false;
     this.setPhase('title');
@@ -392,10 +480,9 @@ export class LanternLaneEngine {
     this.catchesThisLevel = 0;
     this.streak = 0;
     this.falling = [];
+    this.projectiles = [];
     this.trail = [];
-    this.playerX = this.width * 0.5;
-    this.playerVx = 0;
-    this.playerTilt = 0;
+    this.resetPlayerToStartPosition();
     this.squashX = 1;
     this.squashY = 1;
     this.invulnTimer = 0.6;
@@ -408,11 +495,9 @@ export class LanternLaneEngine {
     this.lastDamagedHeartIndex = -1;
     this.pausedRenderedOnce = false;
 
-    const colorDef = LANTERN_COLOR_MAP[this.progress.equippedColor];
-    this.shieldCharge = colorDef.hasShield ? 1 : 0;
-    this.ghostActiveTimer = 0;
-    this.ghostCooldownTimer = 0;
-    this.ghostBufferTimer = 0;
+    this.powerTimer = createInitialPowerTimer(this.progress.equippedColor);
+    this.powerBufferTimer = 0;
+    this.powerFireCooldown = 0;
 
     this.spawnTimer = 0.65;
     this.spawnOpeningGoldLantern();
@@ -425,7 +510,7 @@ export class LanternLaneEngine {
     const offset = (Math.random() - 0.5) * Math.min(180, (this.laneRight - this.laneLeft) * 0.35);
     const x = Math.max(this.laneLeft + 44, Math.min(this.laneRight - 44, this.width * 0.5 + offset));
     this.falling.push({
-      id: this.nextLanternId++,
+      id: this.nextEntityId++,
       kind: 'gold',
       x,
       y: -36,
@@ -470,7 +555,6 @@ export class LanternLaneEngine {
   }
 
   private pickSideBiasedAmbientX(): number {
-    // Keep the central title negative-space calmer by biasing ambient lanterns toward the left & right wings
     const leftSide = Math.random() < 0.5;
     if (leftSide) {
       return 32 + Math.random() * Math.max(60, this.width * 0.32);
@@ -508,6 +592,7 @@ export class LanternLaneEngine {
     this.dpr = Math.min(2, window.devicePixelRatio || 1);
 
     const prevW = this.width || w;
+    const prevH = this.height || h;
     this.width = w;
     this.height = h;
     this.canvas.width = Math.round(w * this.dpr);
@@ -520,23 +605,40 @@ export class LanternLaneEngine {
     this.laneLeft = (w - maxLaneWidth) * 0.5;
     this.laneRight = this.laneLeft + maxLaneWidth;
 
-    const ratio = prevW > 0 ? this.playerX / prevW : 0.5;
-    this.playerX = Math.max(
-      this.laneLeft + PLAYER_RADIUS + 8,
-      Math.min(this.laneRight - PLAYER_RADIUS - 8, ratio * w)
+    const ratioX = prevW > 0 ? this.playerX / prevW : 0.5;
+    const ratioY = prevH > 0 ? this.playerY / prevH : 0.85;
+    const clamped = clampPlayerPosition(
+      ratioX * w,
+      ratioY * h,
+      this.laneLeft,
+      this.laneRight,
+      this.height,
+      PLAYER_RADIUS
     );
-    this.playerY = this.height - Math.max(88, Math.min(132, this.height * 0.145));
+    this.playerX = clamped.x;
+    this.playerY = clamped.y;
     this.pausedRenderedOnce = false;
   };
 
-  private screenToWorldX(clientX: number): number {
+  private screenToWorld(clientX: number, clientY: number): { x: number; y: number } {
     const rect = this.canvas.getBoundingClientRect();
-    if (rect.width <= 0) return this.width * 0.5;
-    return ((clientX - rect.left) / rect.width) * this.width;
+    if (rect.width <= 0 || rect.height <= 0) {
+      return { x: this.width * 0.5, y: this.height * 0.85 };
+    }
+    return {
+      x: ((clientX - rect.left) / rect.width) * this.width,
+      y: ((clientY - rect.top) / rect.height) * this.height,
+    };
   }
 
   private onKeyDown = (e: KeyboardEvent): void => {
-    if (e.code === 'ArrowLeft' || e.code === 'ArrowRight' || e.code === 'Space') {
+    if (
+      e.code === 'ArrowLeft' ||
+      e.code === 'ArrowRight' ||
+      e.code === 'ArrowUp' ||
+      e.code === 'ArrowDown' ||
+      e.code === 'Space'
+    ) {
       if ((this.phase === 'playing' || this.phase === 'title') && !this.modalOpen) {
         e.preventDefault();
       }
@@ -560,7 +662,7 @@ export class LanternLaneEngine {
 
     if (this.phase === 'playing') {
       if (e.code === 'Space' || e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
-        this.triggerGhostPower();
+        this.triggerActivePower();
       }
     }
 
@@ -575,11 +677,13 @@ export class LanternLaneEngine {
     this.audio.unlock();
     if (this.phase !== 'playing' || this.modalOpen) return;
     if (e.button === 2) {
-      this.triggerGhostPower();
+      this.triggerActivePower();
       return;
     }
+    const world = this.screenToWorld(e.clientX, e.clientY);
     this.pointerActive = true;
-    this.pointerTargetX = this.screenToWorldX(e.clientX);
+    this.pointerTargetX = world.x;
+    this.pointerTargetY = world.y;
     try {
       this.canvas.setPointerCapture(e.pointerId);
     } catch {
@@ -589,19 +693,21 @@ export class LanternLaneEngine {
 
   private onPointerMove = (e: PointerEvent): void => {
     if (this.modalOpen) return;
-    const wx = this.screenToWorldX(e.clientX);
+    const world = this.screenToWorld(e.clientX, e.clientY);
     if (this.phase === 'title') {
-      this.titleHoverX = wx;
+      this.titleHoverX = world.x;
       return;
     }
     if (this.phase === 'playing' && this.pointerActive) {
-      this.pointerTargetX = wx;
+      this.pointerTargetX = world.x;
+      this.pointerTargetY = world.y;
     }
   };
 
   private onPointerUp = (): void => {
     this.pointerActive = false;
     this.pointerTargetX = null;
+    this.pointerTargetY = null;
   };
 
   private onContextMenu = (e: MouseEvent): void => {
@@ -614,6 +720,7 @@ export class LanternLaneEngine {
     this.keysHeld.clear();
     this.pointerActive = false;
     this.pointerTargetX = null;
+    this.pointerTargetY = null;
   };
 
   private onVisibilityChange = (): void => {
@@ -621,6 +728,7 @@ export class LanternLaneEngine {
       this.keysHeld.clear();
       this.pointerActive = false;
       this.pointerTargetX = null;
+      this.pointerTargetY = null;
     }
   };
 
@@ -670,7 +778,6 @@ export class LanternLaneEngine {
       this.lastTimestamp = now;
       const dt = Math.min(Math.max(rawDt, 0.001), 0.05);
 
-      // Avoid burning CPU/compositor frames behind static Shop or Pause modals
       const staticOverlay = this.modalOpen || this.phase === 'paused';
       if (staticOverlay) {
         if (!this.pausedRenderedOnce) {
@@ -687,17 +794,35 @@ export class LanternLaneEngine {
     this.rafId = requestAnimationFrame(tick);
   }
 
+  private isPowerActive(type: string): boolean {
+    const def = LANTERN_COLOR_MAP[this.progress.equippedColor];
+    return this.powerTimer.state === 'active' && def.powerType === type;
+  }
+
   private update(dt: number): void {
     this.worldTime += dt;
 
+    const timeSlowActive = this.phase === 'playing' && this.isPowerActive('time_slow');
     const starPace =
       this.phase === 'playing'
-        ? getLevelSpeedMultiplier(
-            this.level,
-            Math.min(1, this.levelElapsed / this.levelDuration),
-            this.progress.helpers.starlight_compass
+        ? getEffectiveFallSpeedMultiplier(
+            getLevelSpeedMultiplier(
+              this.level,
+              Math.min(1, this.levelElapsed / this.levelDuration),
+              this.progress.helpers.starlight_compass
+            ),
+            timeSlowActive
           )
         : 0.42;
+
+    // Smoothly shift the space nebula palette based on live speed multiplier (and breathe softly on title)
+    const targetNebulaIntensity =
+      this.phase === 'playing'
+        ? getNebulaIntensityForSpeed(starPace)
+        : this.phase === 'title'
+          ? 0.14 + 0.06 * Math.sin(this.worldTime * 0.35)
+          : 0.2;
+    this.nebulaIntensity = stepNebulaIntensity(this.nebulaIntensity, targetNebulaIntensity, dt);
 
     for (let i = 0; i < this.stars.length; i++) {
       const s = this.stars[i];
@@ -756,7 +881,7 @@ export class LanternLaneEngine {
     this.levelElapsed += dt;
     const progress01 = Math.min(1, this.levelElapsed / this.levelDuration);
     const compassLevel = this.progress.helpers.starlight_compass;
-    const speedMult = getLevelSpeedMultiplier(this.level, progress01, compassLevel);
+    const baseSpeedMult = getLevelSpeedMultiplier(this.level, progress01, compassLevel);
 
     if (this.progressBarEl) {
       this.progressBarEl.style.transform = `scaleX(${progress01.toFixed(4)})`;
@@ -768,29 +893,40 @@ export class LanternLaneEngine {
     }
 
     const colorDef = LANTERN_COLOR_MAP[this.progress.equippedColor];
+    let hudDirty = false;
 
-    if (colorDef.hasShield && this.shieldCharge < 1) {
-      this.shieldCharge = Math.min(1, this.shieldCharge + dt / colorDef.shieldCooldownSec);
-    }
-
-    if (this.ghostActiveTimer > 0) {
-      this.ghostActiveTimer = Math.max(0, this.ghostActiveTimer - dt);
-      if (this.ghostActiveTimer === 0) {
-        this.ghostCooldownTimer = colorDef.ghostCooldownSec;
+    // Advance unified duration-limited power timer
+    const prevPowerState = this.powerTimer.state;
+    this.powerTimer = tickPowerTimer(this.powerTimer, this.progress.equippedColor, dt);
+    if (prevPowerState !== this.powerTimer.state) {
+      hudDirty = true;
+      if (this.powerTimer.state === 'ready' && prevPowerState === 'cooldown') {
+        this.spawnFloater(this.playerX, this.playerY - 40, 'POWER READY', colorDef.accentHex);
       }
-    } else if (this.ghostCooldownTimer > 0) {
-      this.ghostCooldownTimer = Math.max(0, this.ghostCooldownTimer - dt);
     }
 
-    if (this.ghostBufferTimer > 0) {
-      this.ghostBufferTimer = Math.max(0, this.ghostBufferTimer - dt);
-      if (colorDef.hasGhost && this.ghostActiveTimer <= 0 && this.ghostCooldownTimer <= 0) {
-        this.ghostActiveTimer = colorDef.ghostDurationSec;
-        this.ghostBufferTimer = 0;
-        this.audio.playGhostPhase();
-        this.spawnBurst(this.playerX, this.playerY, '#e2e8f0', 14, 150);
-        this.spawnFloater(this.playerX, this.playerY - 42, 'GHOST PHASE', '#e2e8f0');
-        this.emitHud(true);
+    // Consume buffered power activation input
+    if (this.powerBufferTimer > 0) {
+      this.powerBufferTimer = Math.max(0, this.powerBufferTimer - dt);
+      const result = activatePowerTimer(this.powerTimer, this.progress.equippedColor);
+      if (result.activated) {
+        this.powerTimer = result.next;
+        this.powerBufferTimer = 0;
+        this.powerFireCooldown = 0;
+        hudDirty = true;
+
+        if (colorDef.powerType === 'ghost') {
+          this.audio.playGhostPhase();
+        } else {
+          this.audio.playPowerActivate();
+        }
+        this.spawnBurst(this.playerX, this.playerY, colorDef.accentHex, 16, 170);
+        this.spawnFloater(
+          this.playerX,
+          this.playerY - 44,
+          colorDef.powerName.toUpperCase(),
+          colorDef.bodyCore
+        );
       }
     }
 
@@ -798,37 +934,69 @@ export class LanternLaneEngine {
       this.invulnTimer = Math.max(0, this.invulnTimer - dt);
     }
 
-    const minX = this.laneLeft + PLAYER_RADIUS + 8;
-    const maxX = this.laneRight - PLAYER_RADIUS - 8;
+    // Effective fall speed (slowed during Chrono Frost Time Drift)
+    const fallSpeedMult = getEffectiveFallSpeedMultiplier(
+      baseSpeedMult,
+      this.isPowerActive('time_slow')
+    );
 
+    // 2D Player Movement within lower half of the screen
     const moveLeft = this.keysHeld.has('ArrowLeft') || this.keysHeld.has('KeyA');
     const moveRight = this.keysHeld.has('ArrowRight') || this.keysHeld.has('KeyD');
-    const dir = (moveRight ? 1 : 0) - (moveLeft ? 1 : 0);
+    const moveUp = this.keysHeld.has('ArrowUp') || this.keysHeld.has('KeyW');
+    const moveDown = this.keysHeld.has('ArrowDown') || this.keysHeld.has('KeyS');
 
-    const maxSpeed = 610 * colorDef.speedBonus;
-    if (dir !== 0) {
-      const accel = 4400 * colorDef.speedBonus;
-      this.playerVx += dir * accel * dt;
-      this.playerVx = Math.max(-maxSpeed, Math.min(maxSpeed, this.playerVx));
+    const rawDx = (moveRight ? 1 : 0) - (moveLeft ? 1 : 0);
+    const rawDy = (moveDown ? 1 : 0) - (moveUp ? 1 : 0);
+    const surgeBoost = this.isPowerActive('comet_surge') ? 1.35 : 1;
+    const maxSpeed = 590 * colorDef.speedBonus * surgeBoost;
+
+    if (rawDx !== 0 || rawDy !== 0) {
+      const norm = normalizeMoveVector(rawDx, rawDy);
+      const accel = 4300 * colorDef.speedBonus * surgeBoost;
+      this.playerVx += norm.x * accel * dt;
+      this.playerVy += norm.y * accel * dt;
+      const curSpeed = Math.hypot(this.playerVx, this.playerVy);
+      if (curSpeed > maxSpeed) {
+        this.playerVx = (this.playerVx / curSpeed) * maxSpeed;
+        this.playerVy = (this.playerVy / curSpeed) * maxSpeed;
+      }
       this.pointerActive = false;
       this.pointerTargetX = null;
-    } else if (this.pointerActive && this.pointerTargetX !== null) {
-      const clampedTarget = Math.max(minX, Math.min(maxX, this.pointerTargetX));
-      const diff = clampedTarget - this.playerX;
-      this.playerVx = Math.max(-maxSpeed * 1.45, Math.min(maxSpeed * 1.45, diff * 18));
+      this.pointerTargetY = null;
+    } else if (this.pointerActive && this.pointerTargetX !== null && this.pointerTargetY !== null) {
+      const clampedTarget = clampPlayerPosition(
+        this.pointerTargetX,
+        this.pointerTargetY,
+        this.laneLeft,
+        this.laneRight,
+        this.height,
+        PLAYER_RADIUS
+      );
+      const diffX = clampedTarget.x - this.playerX;
+      const diffY = clampedTarget.y - this.playerY;
+      this.playerVx = Math.max(-maxSpeed * 1.45, Math.min(maxSpeed * 1.45, diffX * 18));
+      this.playerVy = Math.max(-maxSpeed * 1.45, Math.min(maxSpeed * 1.45, diffY * 18));
     } else {
-      this.playerVx *= Math.exp(-15 * dt);
+      const drag = Math.exp(-15 * dt);
+      this.playerVx *= drag;
+      this.playerVy *= drag;
       if (Math.abs(this.playerVx) < 4) this.playerVx = 0;
+      if (Math.abs(this.playerVy) < 4) this.playerVy = 0;
     }
 
-    this.playerX += this.playerVx * dt;
-    if (this.playerX < minX) {
-      this.playerX = minX;
-      this.playerVx = 0;
-    } else if (this.playerX > maxX) {
-      this.playerX = maxX;
-      this.playerVx = 0;
-    }
+    const nextPos = clampPlayerPosition(
+      this.playerX + this.playerVx * dt,
+      this.playerY + this.playerVy * dt,
+      this.laneLeft,
+      this.laneRight,
+      this.height,
+      PLAYER_RADIUS
+    );
+    if (nextPos.x !== this.playerX + this.playerVx * dt) this.playerVx = 0;
+    if (nextPos.y !== this.playerY + this.playerVy * dt) this.playerVy = 0;
+    this.playerX = nextPos.x;
+    this.playerY = nextPos.y;
 
     const targetTilt = Math.max(-0.28, Math.min(0.28, (this.playerVx / maxSpeed) * 0.24));
     this.playerTilt += (targetTilt - this.playerTilt) * Math.min(1, dt * 16);
@@ -836,25 +1004,95 @@ export class LanternLaneEngine {
     this.squashX += (1 - this.squashX) * Math.min(1, dt * 13);
     this.squashY += (1 - this.squashY) * Math.min(1, dt * 13);
 
-    if (Math.abs(this.playerVx) > 85 || colorDef.id === 'crimson') {
-      this.trail.push({ x: this.playerX, y: this.playerY, alpha: colorDef.id === 'crimson' ? 0.55 : 0.25 });
-      if (this.trail.length > 10) this.trail.shift();
+    const speedMag = Math.hypot(this.playerVx, this.playerVy);
+    if (speedMag > 90 || this.isPowerActive('comet_surge')) {
+      this.trail.push({
+        x: this.playerX,
+        y: this.playerY,
+        alpha: this.isPowerActive('comet_surge') ? 0.65 : 0.25,
+      });
+      if (this.trail.length > 12) this.trail.shift();
     }
     for (let i = this.trail.length - 1; i >= 0; i--) {
-      this.trail[i].alpha -= dt * 2.2;
+      this.trail[i].alpha -= dt * 2.4;
       if (this.trail[i].alpha <= 0) {
         this.trail.splice(i, 1);
       }
     }
 
-    this.spawnTimer -= dt;
+    // Fire active projectiles for Candle Shot or Starlight Sky Net
+    if (this.isPowerActive('candle_shot')) {
+      this.powerFireCooldown -= dt;
+      if (this.powerFireCooldown <= 0) {
+        this.powerFireCooldown = 0.34;
+        this.spawnCandleBolt();
+      }
+    } else if (this.isPowerActive('sky_net')) {
+      this.powerFireCooldown -= dt;
+      if (this.powerFireCooldown <= 0) {
+        this.powerFireCooldown = 0.42;
+        this.spawnStarlightWisps();
+      }
+    }
+
+    // Update projectiles & check hits against falling lanterns
+    for (let pIdx = this.projectiles.length - 1; pIdx >= 0; pIdx--) {
+      const proj = this.projectiles[pIdx];
+      proj.life += dt;
+      proj.x += proj.vx * dt;
+      proj.y += proj.vy * dt;
+
+      if (proj.style === 'starlight') {
+        // Gentle sweeping wave across the lane to catch nearby gold lanterns
+        proj.vx += Math.sin(proj.life * 8) * 180 * dt;
+      }
+
+      if (proj.life >= proj.maxLife || proj.y < -40 || proj.x < this.laneLeft - 30 || proj.x > this.laneRight + 30) {
+        this.projectiles.splice(pIdx, 1);
+        continue;
+      }
+
+      let consumed = false;
+      for (let i = 0; i < this.falling.length; i++) {
+        const item = this.falling[i];
+        if (item.caughtOrHit || item.telegraphTime > 0) continue;
+
+        if (circlesOverlap(proj.x, proj.y, proj.radius + 4, item.x, item.y, item.radius + 3)) {
+          const outcome = resolveProjectileHit(proj.style, item.kind);
+          if (outcome === 'catch_gold') {
+            this.handleGoldCatch(item);
+            hudDirty = true;
+            consumed = true;
+            break;
+          } else if (outcome === 'eliminate_purple') {
+            item.caughtOrHit = true;
+            this.audio.playEliminateObstacle();
+            this.spawnBurst(item.x, item.y, '#fb923c', 16, 200);
+            this.spawnBurst(item.x, item.y, '#c084fc', 10, 150);
+            this.spawnFloater(item.x, item.y - 18, 'CLEARED', '#fdba74');
+            consumed = true;
+            break;
+          }
+        }
+      }
+
+      if (consumed) {
+        this.projectiles.splice(pIdx, 1);
+      }
+    }
+
+    // Spawning falling lanterns
+    this.spawnTimer -= dt * (timeSlowActive ? 0.65 : 1);
     if (this.spawnTimer <= 0) {
-      this.spawnLantern(progress01, speedMult);
+      this.spawnLantern(progress01, baseSpeedMult);
       const interval = getSpawnIntervalSec(this.level, progress01, compassLevel);
       this.spawnTimer = interval * (0.82 + Math.random() * 0.36);
     }
 
-    let hudDirty = false;
+    // Update falling lanterns
+    const magnetActive = this.isPowerActive('magnet');
+    const skyNetActive = this.isPowerActive('sky_net');
+
     for (let i = this.falling.length - 1; i >= 0; i--) {
       const item = this.falling[i];
       if (item.caughtOrHit) {
@@ -868,13 +1106,13 @@ export class LanternLaneEngine {
       item.age += dt;
 
       if (item.telegraphTime > 0) {
-        item.telegraphTime = Math.max(0, item.telegraphTime - dt);
+        item.telegraphTime = Math.max(0, item.telegraphTime - dt * (timeSlowActive ? TIME_SLOW_FACTOR : 1));
         continue;
       }
 
       const isGold = item.kind === 'gold' || item.kind === 'radiant';
 
-      if (isGold && colorDef.hasMagnet) {
+      if (isGold && magnetActive) {
         const pull = computeMagnetPull(
           this.playerX,
           this.playerY,
@@ -891,7 +1129,7 @@ export class LanternLaneEngine {
       }
 
       if (item.kind === 'purple_sway' || item.kind === 'gold' || item.kind === 'radiant') {
-        if (!colorDef.hasMagnet || !isGold) {
+        if (!magnetActive || !isGold) {
           item.x = item.baseX + Math.sin(item.age * item.swayFreq + item.swayPhase) * item.swayAmp;
         } else {
           item.x += item.vx * dt;
@@ -912,9 +1150,11 @@ export class LanternLaneEngine {
       }
 
       item.x = Math.max(this.laneLeft + item.radius + 6, Math.min(this.laneRight - item.radius - 6, item.x));
-      item.y += item.vy * speedMult * dt;
+      item.y += item.vy * fallSpeedMult * dt;
 
-      const hitRadius = isGold ? PLAYER_RADIUS + 5 : PLAYER_RADIUS - 4;
+      // Sky Net expands the player's golden capture halo while active
+      const goldCatchBonus = skyNetActive ? 22 : 5;
+      const hitRadius = isGold ? PLAYER_RADIUS + goldCatchBonus : PLAYER_RADIUS - 4;
       const itemHitRadius = isGold ? item.radius + 3 : item.radius - 3;
 
       if (circlesOverlap(this.playerX, this.playerY, hitRadius, item.x, item.y, itemHitRadius)) {
@@ -931,10 +1171,48 @@ export class LanternLaneEngine {
     }
 
     this.hudEmitTimer += dt;
-    if (hudDirty || this.hudEmitTimer >= 0.12) {
+    if (hudDirty || this.hudEmitTimer >= 0.1) {
       this.hudEmitTimer = 0;
       this.emitHud(false);
     }
+  }
+
+  private spawnCandleBolt(): void {
+    this.projectiles.push({
+      id: this.nextEntityId++,
+      x: this.playerX,
+      y: this.playerY - PLAYER_RADIUS - 8,
+      vx: this.playerVx * 0.12,
+      vy: -620,
+      radius: 13,
+      life: 0,
+      maxLife: 1.5,
+      style: 'candle',
+    });
+    this.squashX = 1.12;
+    this.squashY = 0.9;
+    this.audio.playCandleShoot();
+    this.spawnBurst(this.playerX, this.playerY - PLAYER_RADIUS - 4, '#fdba74', 5, 95);
+  }
+
+  private spawnStarlightWisps(): void {
+    // Twin golden starlight wisps fanning upward to catch falling gold lanterns across the lane
+    const spreads = [-135, 135];
+    for (let i = 0; i < spreads.length; i++) {
+      this.projectiles.push({
+        id: this.nextEntityId++,
+        x: this.playerX + (i === 0 ? -12 : 12),
+        y: this.playerY - PLAYER_RADIUS - 4,
+        vx: spreads[i],
+        vy: -520,
+        radius: 16,
+        life: 0,
+        maxLife: 1.4,
+        style: 'starlight',
+      });
+    }
+    this.audio.playCandleShoot();
+    this.spawnBurst(this.playerX, this.playerY - PLAYER_RADIUS, '#fde047', 6, 110);
   }
 
   private spawnLantern(progress01: number, speedMult: number): void {
@@ -960,7 +1238,7 @@ export class LanternLaneEngine {
     if (!isPurple) {
       const isRadiant = Math.random() < (this.level >= 2 ? 0.13 : 0.08);
       this.falling.push({
-        id: this.nextLanternId++,
+        id: this.nextEntityId++,
         kind: isRadiant ? 'radiant' : 'gold',
         x,
         y: -30,
@@ -996,7 +1274,7 @@ export class LanternLaneEngine {
       const telegraph = (kind === 'purple_drop' ? 0.42 : 0.34) + compassBonus + (speedMult > 1.55 ? 0.06 : 0);
 
       this.falling.push({
-        id: this.nextLanternId++,
+        id: this.nextEntityId++,
         kind,
         x,
         y: 12,
@@ -1029,7 +1307,8 @@ export class LanternLaneEngine {
       isRadiant,
       this.streak,
       this.progress.helpers.bonus_rewards,
-      this.progress.equippedColor
+      this.progress.equippedColor,
+      this.powerTimer.state === 'active'
     );
 
     this.levelGold += earned;
@@ -1062,12 +1341,11 @@ export class LanternLaneEngine {
   }
 
   private handlePurpleCollision(item: FallingLantern): boolean {
-    const colorDef = LANTERN_COLOR_MAP[this.progress.equippedColor];
     const resolution = resolvePurpleHit({
       hearts: this.hearts,
       invulnerable: this.invulnTimer > 0,
-      ghostActive: this.ghostActiveTimer > 0,
-      shieldReady: colorDef.hasShield && this.shieldCharge >= 1,
+      ghostActive: this.isPowerActive('ghost'),
+      shieldActive: this.isPowerActive('shield'),
     });
 
     if (resolution.outcome === 'ghost_phase') {
@@ -1086,15 +1364,13 @@ export class LanternLaneEngine {
     item.caughtOrHit = true;
 
     if (resolution.outcome === 'shield_block') {
-      this.shieldCharge = 0;
-      this.invulnTimer = 0.65;
-      this.hitstopTimer = 0.04;
-      this.trauma = Math.min(1, this.trauma + 0.38);
+      this.hitstopTimer = 0.035;
+      this.trauma = Math.min(1, this.trauma + 0.34);
       this.squashX = 1.24;
       this.squashY = 0.8;
       this.audio.playShieldBlock();
       this.spawnBurst(item.x, item.y, '#34d399', 20, 210);
-      this.spawnFloater(this.playerX, this.playerY - 40, 'WARD BLOCKED', '#6ee7b7');
+      this.spawnFloater(item.x, item.y - 26, 'WARD SHATTER', '#6ee7b7');
       return true;
     }
 
@@ -1144,6 +1420,7 @@ export class LanternLaneEngine {
     this.audio.playLevelClear();
     this.spawnBurst(this.playerX, this.playerY, '#fbbf24', 28, 260);
     this.falling = [];
+    this.projectiles = [];
 
     const summary: RunSummary = {
       outcome: 'levelclear',
@@ -1180,6 +1457,7 @@ export class LanternLaneEngine {
       levelProgress: progress01,
     };
 
+    this.projectiles = [];
     this.setPhase('gameover');
     this.callbacks.onRunSummary(summary);
     this.emitHud(true);
@@ -1250,13 +1528,6 @@ export class LanternLaneEngine {
   private emitHud(force: boolean): void {
     const progress01 = Math.min(1, this.levelElapsed / Math.max(1, this.levelDuration));
     const colorDef = LANTERN_COLOR_MAP[this.progress.equippedColor];
-    const ghostCharge01 = !colorDef.hasGhost
-      ? 0
-      : this.ghostActiveTimer > 0
-        ? this.ghostActiveTimer / colorDef.ghostDurationSec
-        : this.ghostCooldownTimer > 0
-          ? 1 - this.ghostCooldownTimer / colorDef.ghostCooldownSec
-          : 1;
 
     const snapshot: HudSnapshot = {
       phase: this.phase,
@@ -1277,13 +1548,18 @@ export class LanternLaneEngine {
         this.progress.helpers.starlight_compass
       ),
       equippedColor: this.progress.equippedColor,
-      shieldReady: colorDef.hasShield && this.shieldCharge >= 1,
-      shieldCharge01: this.shieldCharge,
-      ghostActive: this.ghostActiveTimer > 0,
-      ghostReady: colorDef.hasGhost && this.ghostActiveTimer <= 0 && this.ghostCooldownTimer <= 0,
-      ghostCharge01,
+      powerState: this.powerTimer.state,
+      powerRemainingSec: this.powerTimer.activeRemaining,
+      powerDurationSec: colorDef.powerDurationSec,
+      powerCharge01: this.powerTimer.charge01,
       muted: this.audio.isMuted(),
     };
+
+    if (typeof document !== 'undefined') {
+      document.body.dataset.powerState = this.powerTimer.state;
+      document.body.dataset.playerYRatio = (this.playerY / Math.max(1, this.height)).toFixed(2);
+      document.body.dataset.nebulaIntensity = this.nebulaIntensity.toFixed(2);
+    }
 
     if (force || this.phase === 'playing') {
       this.callbacks.onHudUpdate(snapshot);
@@ -1291,7 +1567,7 @@ export class LanternLaneEngine {
   }
 
   // =========================================================================
-  // RENDERING (Pre-cached backdrop & glow stamps for silky 60fps everywhere)
+  // RENDERING
   // =========================================================================
 
   private render(): void {
@@ -1308,8 +1584,30 @@ export class LanternLaneEngine {
       ctx.translate(ox, oy);
     }
 
-    // 1. Pre-rendered deep space + cosmic nebula backdrop
-    ctx.drawImage(this.bgCanvas, 0, 0, w, h);
+    // 1. Pre-rendered deep space nebula with smooth speed-driven color cross-fading
+    const nebulaWeights = getNebulaLayerWeights(this.nebulaIntensity);
+    if (nebulaWeights.calm > 0) {
+      ctx.globalAlpha = 1;
+      ctx.drawImage(this.bgCalmCanvas, 0, 0, w, h);
+      if (nebulaWeights.mid > 0.005) {
+        ctx.globalAlpha = nebulaWeights.mid;
+        ctx.drawImage(this.bgMidCanvas, 0, 0, w, h);
+      }
+    } else {
+      ctx.globalAlpha = 1;
+      ctx.drawImage(this.bgMidCanvas, 0, 0, w, h);
+      if (nebulaWeights.peak > 0.005) {
+        ctx.globalAlpha = nebulaWeights.peak;
+        ctx.drawImage(this.bgPeakCanvas, 0, 0, w, h);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Subtle frosty cosmic tint during active Chrono Frost Time Drift
+    if (this.phase === 'playing' && this.isPowerActive('time_slow')) {
+      ctx.fillStyle = 'rgba(34, 211, 238, 0.07)';
+      ctx.fillRect(0, 0, w, h);
+    }
 
     // 2. Parallax stars
     for (let i = 0; i < this.stars.length; i++) {
@@ -1323,10 +1621,10 @@ export class LanternLaneEngine {
     }
     ctx.globalAlpha = 1;
 
-    // 3. Celestial Lantern Lane guide rails
+    // 3. Celestial Lantern Lane guide rails + Lower-Half flight horizon
     this.drawLaneGuides(ctx, h);
 
-    // 4. Ambient drifting lanterns on title screen (kept out of central title lockup negative space)
+    // 4. Ambient drifting lanterns on title screen
     if (this.phase === 'title') {
       for (let i = 0; i < this.ambient.length; i++) {
         const a = this.ambient[i];
@@ -1346,13 +1644,20 @@ export class LanternLaneEngine {
       }
     }
 
-    // 5. Magnet field & attraction threads
+    // 5. Magnet field & attraction threads (only while Magnet power duration is active!)
     const colorDef = LANTERN_COLOR_MAP[this.progress.equippedColor];
-    if (this.phase === 'playing' && colorDef.hasMagnet) {
+    if (this.phase === 'playing' && this.isPowerActive('magnet')) {
       this.drawMagnetField(ctx, colorDef.magnetRadius);
     }
 
-    // 6. Falling gold & purple lanterns + purple top-edge entry telegraphs
+    // 6. Active Candle & Starlight Net projectiles
+    if (this.phase === 'playing' && this.projectiles.length > 0) {
+      for (let i = 0; i < this.projectiles.length; i++) {
+        this.drawProjectile(ctx, this.projectiles[i]);
+      }
+    }
+
+    // 7. Falling gold & purple lanterns + purple top-edge entry telegraphs
     if (this.phase !== 'title') {
       for (let i = 0; i < this.falling.length; i++) {
         const item = this.falling[i];
@@ -1377,7 +1682,7 @@ export class LanternLaneEngine {
       }
     }
 
-    // 7. Player motion trail
+    // 8. Player motion trail
     for (let i = 0; i < this.trail.length; i++) {
       const t = this.trail[i];
       ctx.save();
@@ -1389,10 +1694,10 @@ export class LanternLaneEngine {
       ctx.restore();
     }
 
-    // 8. Player glowing lantern
+    // 9. Player glowing lantern
     this.drawPlayerLantern(ctx);
 
-    // 9. Pooled particles
+    // 10. Pooled particles
     for (let i = 0; i < PARTICLE_POOL_SIZE; i++) {
       const p = this.particles[i];
       if (!p.active) continue;
@@ -1405,7 +1710,7 @@ export class LanternLaneEngine {
     }
     ctx.globalAlpha = 1;
 
-    // 10. Floating score / power cues
+    // 11. Floating score / power cues
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.font = '700 15px "JetBrains Mono", monospace';
@@ -1421,7 +1726,7 @@ export class LanternLaneEngine {
     }
     ctx.globalAlpha = 1;
 
-    // 11. Subtle peripheral crimson vignette on low hearts or recent damage
+    // 12. Subtle peripheral crimson vignette on low hearts or recent damage
     if (this.phase === 'playing' && (this.hearts === 1 || this.damageFlashTimer > 0)) {
       const lowAlpha = this.hearts === 1 ? 0.14 + 0.06 * Math.sin(this.worldTime * 4.5) : 0;
       const dmgAlpha = this.damageFlashTimer > 0 ? (this.damageFlashTimer / 0.45) * 0.28 : 0;
@@ -1459,24 +1764,96 @@ export class LanternLaneEngine {
     ctx.lineTo(this.laneRight, h);
     ctx.stroke();
 
+    // Lower-half celestial flight ceiling horizon at 50% viewport height
     if (isPlaying) {
-      ctx.strokeStyle = 'rgba(251, 191, 36, 0.14)';
+      const horizonY = Math.round(h * 0.5);
+      const nearCeiling = this.playerY < horizonY + 64;
+      ctx.save();
+      ctx.strokeStyle = nearCeiling
+        ? 'rgba(251, 191, 36, 0.34)'
+        : 'rgba(251, 191, 36, 0.15)';
       ctx.lineWidth = 1;
+      ctx.setLineDash([6, 10]);
       ctx.beginPath();
-      ctx.moveTo(this.laneLeft + 24, this.playerY + 26);
-      ctx.lineTo(this.laneRight - 24, this.playerY + 26);
+      ctx.moveTo(this.laneLeft + 10, horizonY);
+      ctx.lineTo(this.laneRight - 10, horizonY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Tiny corner ticks on left & right rails marking the half-screen flight ceiling
+      ctx.fillStyle = nearCeiling ? 'rgba(253, 224, 71, 0.7)' : 'rgba(251, 191, 36, 0.35)';
+      ctx.beginPath();
+      ctx.arc(this.laneLeft, horizonY, 3, 0, Math.PI * 2);
+      ctx.arc(this.laneRight, horizonY, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  private drawProjectile(ctx: CanvasRenderingContext2D, proj: CandleProjectile): void {
+    ctx.save();
+    ctx.translate(proj.x, proj.y);
+
+    if (proj.style === 'candle') {
+      // Glowing amber halo
+      this.drawGlow(ctx, 'candle', 26);
+
+      // Wax candle stick
+      ctx.fillStyle = '#fff7ed';
+      ctx.strokeStyle = '#ea580c';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.roundRect(-4.5, -2, 9, 16, 2.5);
+      ctx.fill();
+      ctx.stroke();
+
+      // Flickering teardrop flame
+      const flicker = Math.sin(this.worldTime * 35 + proj.id) * 1.4;
+      ctx.fillStyle = '#fb923c';
+      ctx.beginPath();
+      ctx.moveTo(0, -17);
+      ctx.quadraticCurveTo(7 + flicker * 0.4, -7, 0, -2);
+      ctx.quadraticCurveTo(-7 - flicker * 0.4, -7, 0, -17);
+      ctx.fill();
+
+      // Hot bright flame core
+      ctx.fillStyle = '#fef08a';
+      ctx.beginPath();
+      ctx.moveTo(0, -12);
+      ctx.quadraticCurveTo(3.2, -6.5, 0, -3);
+      ctx.quadraticCurveTo(-3.2, -6.5, 0, -12);
+      ctx.fill();
+    } else {
+      // Starlight Sky Net glowing capture wisp
+      this.drawGlow(ctx, 'prism', 30);
+      const rot = this.worldTime * 6 + proj.id;
+      ctx.rotate(rot);
+      ctx.fillStyle = '#fef08a';
+      ctx.strokeStyle = '#facc15';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      for (let i = 0; i < 8; i++) {
+        const angle = (Math.PI * i) / 4;
+        const rad = i % 2 === 0 ? 12 : 4.5;
+        if (i === 0) ctx.moveTo(Math.cos(angle) * rad, Math.sin(angle) * rad);
+        else ctx.lineTo(Math.cos(angle) * rad, Math.sin(angle) * rad);
+      }
+      ctx.closePath();
+      ctx.fill();
       ctx.stroke();
     }
+
+    ctx.restore();
   }
 
   private drawMagnetField(ctx: CanvasRenderingContext2D, radius: number): void {
     const pulse = 0.85 + 0.15 * Math.sin(this.worldTime * 4);
     ctx.save();
-    ctx.strokeStyle = `rgba(56, 189, 248, ${(0.2 * pulse).toFixed(3)})`;
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = `rgba(56, 189, 248, ${(0.28 * pulse).toFixed(3)})`;
+    ctx.lineWidth = 1.8;
     ctx.setLineDash([6, 8]);
     ctx.beginPath();
-    ctx.arc(this.playerX, this.playerY, radius, Math.PI * 1.08, Math.PI * 1.92);
+    ctx.arc(this.playerX, this.playerY, radius, 0, Math.PI * 2);
     ctx.stroke();
     ctx.setLineDash([]);
 
@@ -1488,8 +1865,8 @@ export class LanternLaneEngine {
       const dist = Math.hypot(dx, dy);
       if (dist < radius) {
         const strength = 1 - dist / radius;
-        ctx.strokeStyle = `rgba(125, 211, 252, ${(0.48 * strength).toFixed(3)})`;
-        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = `rgba(125, 211, 252, ${(0.55 * strength).toFixed(3)})`;
+        ctx.lineWidth = 1.8;
         ctx.beginPath();
         ctx.moveTo(this.playerX, this.playerY - 8);
         ctx.lineTo(item.x, item.y);
@@ -1543,25 +1920,21 @@ export class LanternLaneEngine {
     ctx.ellipse(0, 0, r * 0.82, r, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Inner bright core
     ctx.fillStyle = '#fffbeb';
     ctx.beginPath();
     ctx.ellipse(-r * 0.1, -r * 0.1, r * 0.42, r * 0.56, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Delicate lantern ribs
     ctx.strokeStyle = 'rgba(146, 64, 14, 0.46)';
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.ellipse(0, 0, r * 0.42, r * 0.98, 0, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Brass caps
     ctx.fillStyle = '#78350f';
     ctx.fillRect(-r * 0.42, -r * 1.08, r * 0.84, r * 0.2);
     ctx.fillRect(-r * 0.36, r * 0.9, r * 0.72, r * 0.18);
 
-    // Tassel
     ctx.strokeStyle = isRadiant ? '#fef08a' : '#f59e0b';
     ctx.lineWidth = 1.6;
     ctx.beginPath();
@@ -1610,7 +1983,6 @@ export class LanternLaneEngine {
     ctx.closePath();
     ctx.fill();
 
-    // Bright violet core
     ctx.fillStyle = '#e9d5ff';
     ctx.beginPath();
     ctx.arc(0, -r * 0.05, r * 0.38, 0, Math.PI * 2);
@@ -1628,7 +2000,6 @@ export class LanternLaneEngine {
     ctx.closePath();
     ctx.stroke();
 
-    // Inner X hazard sigil
     ctx.strokeStyle = 'rgba(59, 7, 100, 0.9)';
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -1651,7 +2022,9 @@ export class LanternLaneEngine {
 
   private drawPlayerLantern(ctx: CanvasRenderingContext2D): void {
     const colorDef = LANTERN_COLOR_MAP[this.progress.equippedColor];
-    const isGhosting = this.ghostActiveTimer > 0;
+    const isGhosting = this.isPowerActive('ghost');
+    const isShielding = this.isPowerActive('shield');
+    const isSkyNet = this.isPowerActive('sky_net');
     const isBlinking =
       this.invulnTimer > 0 &&
       this.phase === 'playing' &&
@@ -1663,34 +2036,59 @@ export class LanternLaneEngine {
     ctx.scale(this.squashX, this.squashY);
 
     if (isGhosting) {
-      ctx.globalAlpha = 0.48 + 0.16 * Math.sin(this.worldTime * 16);
+      ctx.globalAlpha = 0.45 + 0.16 * Math.sin(this.worldTime * 16);
     } else if (isBlinking) {
       ctx.globalAlpha = 0.45;
     }
 
     const r = PLAYER_RADIUS;
 
-    this.drawGlow(ctx, this.hitFlashTimer > 0 ? 'flash' : colorDef.id, r * 2.45);
+    this.drawGlow(ctx, this.hitFlashTimer > 0 ? 'flash' : colorDef.id, r * 2.5);
+
+    // Expanded golden capture halo while Starlight Net is active
+    if (isSkyNet) {
+      ctx.save();
+      ctx.globalAlpha = 0.35 + 0.15 * Math.sin(this.worldTime * 8);
+      ctx.strokeStyle = '#fde047';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      ctx.arc(0, 0, r + 22, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    // Active jade Aegis Shield dome
+    if (isShielding) {
+      ctx.save();
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = 'rgba(52, 211, 153, 0.16)';
+      ctx.strokeStyle = '#6ee7b7';
+      ctx.lineWidth = 2.4;
+      ctx.beginPath();
+      ctx.arc(0, 0, r * 1.56, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
 
     ctx.fillStyle = this.hitFlashTimer > 0 ? '#ffffff' : colorDef.accentHex;
     ctx.beginPath();
     ctx.ellipse(0, 0, r * 0.92, r * 1.06, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Inner bright gradient-like highlight
     ctx.fillStyle = this.hitFlashTimer > 0 ? '#ffffff' : colorDef.bodyCore;
     ctx.beginPath();
     ctx.ellipse(-r * 0.1, -r * 0.14, r * 0.54, r * 0.68, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Ornate curved ribs
     ctx.strokeStyle = 'rgba(15, 23, 42, 0.36)';
     ctx.lineWidth = 1.4;
     ctx.beginPath();
     ctx.ellipse(0, 0, r * 0.48, r * 1.04, 0, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Inner incandescent filament diamond
     ctx.fillStyle = '#ffffff';
     ctx.beginPath();
     ctx.moveTo(0, -r * 0.34);
@@ -1700,7 +2098,6 @@ export class LanternLaneEngine {
     ctx.closePath();
     ctx.fill();
 
-    // Top crown & handle ring
     ctx.fillStyle = '#1e1b2e';
     ctx.strokeStyle = colorDef.trimColor;
     ctx.lineWidth = 1.4;
@@ -1726,50 +2123,53 @@ export class LanternLaneEngine {
     ctx.quadraticCurveTo(tasselLag * 0.5, r * 1.46, tasselLag, r * 1.72);
     ctx.stroke();
 
-    // Diegetic on-lantern power ring
-    ctx.globalAlpha = 1;
-    if (colorDef.hasShield) {
-      if (this.shieldCharge >= 1) {
-        ctx.strokeStyle = 'rgba(110, 231, 183, 0.88)';
-        ctx.lineWidth = 2.5;
+    // Diegetic on-lantern duration / cooldown ring for ALL earned powers!
+    if (this.phase === 'playing' && colorDef.powerType !== 'none') {
+      ctx.globalAlpha = 1;
+      if (this.powerTimer.state === 'active') {
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+        ctx.lineWidth = 2.6;
         ctx.beginPath();
         ctx.arc(0, 0, r * 1.48, 0, Math.PI * 2);
         ctx.stroke();
-      } else if (this.phase === 'playing') {
-        ctx.strokeStyle = 'rgba(52, 211, 153, 0.25)';
+
+        ctx.strokeStyle = colorDef.accentHex;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(
+          0,
+          0,
+          r * 1.48,
+          -Math.PI / 2,
+          -Math.PI / 2 + Math.PI * 2 * this.powerTimer.charge01
+        );
+        ctx.stroke();
+      } else if (this.powerTimer.state === 'cooldown') {
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(0, 0, r * 1.44, 0, Math.PI * 2);
         ctx.stroke();
 
-        ctx.strokeStyle = 'rgba(110, 231, 183, 0.9)';
-        ctx.lineWidth = 2.2;
+        ctx.strokeStyle = colorDef.trimColor;
+        ctx.globalAlpha = 0.6;
+        ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(
           0,
           0,
           r * 1.44,
           -Math.PI / 2,
-          -Math.PI / 2 + Math.PI * 2 * this.shieldCharge
+          -Math.PI / 2 + Math.PI * 2 * this.powerTimer.charge01
         );
         ctx.stroke();
-      }
-    } else if (colorDef.hasGhost && this.phase === 'playing') {
-      if (this.ghostActiveTimer > 0) {
-        const frac = this.ghostActiveTimer / colorDef.ghostDurationSec;
-        ctx.strokeStyle = 'rgba(241, 245, 249, 0.9)';
-        ctx.lineWidth = 2.5;
-        ctx.setLineDash([4, 4]);
+      } else if (this.powerTimer.state === 'ready') {
+        // Subtle pulsing ready halo dot at top
+        ctx.strokeStyle = colorDef.accentHex;
+        ctx.globalAlpha = 0.32 + 0.18 * Math.sin(this.worldTime * 4.5);
+        ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.arc(0, 0, r * 1.5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * frac);
-        ctx.stroke();
-        ctx.setLineDash([]);
-      } else if (this.ghostCooldownTimer > 0) {
-        const frac = 1 - this.ghostCooldownTimer / colorDef.ghostCooldownSec;
-        ctx.strokeStyle = 'rgba(203, 213, 225, 0.45)';
-        ctx.lineWidth = 1.8;
-        ctx.beginPath();
-        ctx.arc(0, 0, r * 1.44, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * frac);
+        ctx.arc(0, 0, r * 1.44, 0, Math.PI * 2);
         ctx.stroke();
       }
     }

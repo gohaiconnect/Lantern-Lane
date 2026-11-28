@@ -14,7 +14,7 @@ interface GameHudProps {
   onReturnTitle: () => void;
   onOpenShop: () => void;
   onToggleMute: () => void;
-  onTriggerGhost: () => void;
+  onTriggerPower: () => void;
 }
 
 const PACE_LABELS: Record<HudSnapshot['paceZone'], string> = {
@@ -34,7 +34,7 @@ export const GameHud: React.FC<GameHudProps> = ({
   onReturnTitle,
   onOpenShop,
   onToggleMute,
-  onTriggerGhost,
+  onTriggerPower,
 }) => {
   const colorDef = LANTERN_COLOR_MAP[hud.equippedColor];
   const isPlaying = hud.phase === 'playing';
@@ -66,47 +66,52 @@ export const GameHud: React.FC<GameHudProps> = ({
                 })}
               </div>
 
-              {/* Active Power Readout (only shown for special power colors) */}
-              {colorDef.hasShield && (
-                <div className="text-[11px] font-medium tracking-wide text-emerald-200/90 hud-stroke">
-                  {hud.shieldReady
-                    ? 'Aegis Shield · Ready'
-                    : `Aegis Shield · ${Math.round(hud.shieldCharge01 * 100)}%`}
-                </div>
-              )}
-              {colorDef.hasMagnet && (
-                <div className="text-[11px] font-medium tracking-wide text-sky-200/90 hud-stroke">
-                  Gold Magnet · Active
-                </div>
-              )}
-              {colorDef.hasGhost && (
+              {/* Unified Duration-Based Active Power Gauge & Trigger Button */}
+              {colorDef.powerType !== 'none' && (
                 <button
                   type="button"
                   tabIndex={-1}
                   onClick={(e) => {
                     e.currentTarget.blur();
-                    onTriggerGhost();
+                    onTriggerPower();
                   }}
-                  disabled={!hud.ghostReady}
-                  className={`pointer-events-auto self-start mt-0.5 px-2.5 py-1 rounded-md text-[11px] font-semibold tracking-wide transition-colors ${
-                    hud.ghostActive
-                      ? 'bg-slate-100 text-slate-950'
-                      : hud.ghostReady
-                        ? 'bg-[#1a2248]/90 text-slate-100 border border-slate-200/35 hover:bg-[#253063] cursor-pointer'
-                        : 'bg-[#10152e]/80 text-slate-300/60 border border-slate-300/15'
+                  disabled={hud.powerState !== 'ready'}
+                  aria-label={
+                    hud.powerState === 'active'
+                      ? `${colorDef.powerName} active, ${hud.powerRemainingSec.toFixed(1)} seconds left`
+                      : hud.powerState === 'ready'
+                        ? `Activate ${colorDef.powerName} power`
+                        : `${colorDef.powerName} recharging ${Math.round(hud.powerCharge01 * 100)} percent`
+                  }
+                  className={`pointer-events-auto self-start mt-0.5 min-w-[168px] px-2.5 py-1.5 rounded-lg text-left transition-colors border ${
+                    hud.powerState === 'active'
+                      ? 'bg-[#1a244d]/95 border-amber-300/70 text-amber-50'
+                      : hud.powerState === 'ready'
+                        ? 'bg-[#141c3d]/92 hover:bg-[#1e2959] border-amber-200/35 text-amber-50 cursor-pointer'
+                        : 'bg-[#0c1129]/85 border-amber-100/15 text-amber-100/65'
                   }`}
                 >
-                  {hud.ghostActive
-                    ? 'Ghost Active'
-                    : hud.ghostReady
-                      ? 'Ghost [Space] · Ready'
-                      : `Ghost · ${Math.round(hud.ghostCharge01 * 100)}%`}
+                  <div className="flex items-center justify-between gap-2 text-[11px] font-semibold leading-none">
+                    <span className="truncate">{colorDef.powerName}</span>
+                    <span className="font-mono-num shrink-0" style={{ color: colorDef.accentHex }}>
+                      {hud.powerState === 'active'
+                        ? `${hud.powerRemainingSec.toFixed(1)}s`
+                        : hud.powerState === 'ready'
+                          ? 'Space'
+                          : `${Math.round(hud.powerCharge01 * 100)}%`}
+                    </span>
+                  </div>
+                  <div className="w-full h-1.5 mt-1.5 rounded-full bg-[#070a1c] overflow-hidden">
+                    <div
+                      className="h-full w-full origin-left rounded-full"
+                      style={{
+                        backgroundColor:
+                          hud.powerState === 'cooldown' ? 'rgba(226,232,240,0.4)' : colorDef.accentHex,
+                        transform: `scaleX(${Math.max(0, Math.min(1, hud.powerCharge01)).toFixed(3)})`,
+                      }}
+                    />
+                  </div>
                 </button>
-              )}
-              {colorDef.streakBonusEvery > 0 && hud.streak > 0 && (
-                <div className="text-[11px] font-mono-num text-rose-200/90 hud-stroke">
-                  Comet Streak {hud.streak}
-                </div>
               )}
             </div>
 

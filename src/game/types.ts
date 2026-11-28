@@ -1,6 +1,26 @@
 export type GamePhase = 'title' | 'playing' | 'paused' | 'levelclear' | 'gameover';
 
-export type LanternColorId = 'solar' | 'cobalt' | 'emerald' | 'pearl' | 'crimson';
+export type LanternColorId =
+  | 'solar'
+  | 'cobalt'
+  | 'emerald'
+  | 'pearl'
+  | 'candle'
+  | 'prism'
+  | 'frost'
+  | 'crimson';
+
+export type PowerType =
+  | 'none'
+  | 'magnet'
+  | 'shield'
+  | 'ghost'
+  | 'candle_shot'
+  | 'sky_net'
+  | 'time_slow'
+  | 'comet_surge';
+
+export type PowerState = 'none' | 'ready' | 'active' | 'cooldown';
 
 export type HelperId = 'extra_heart' | 'bonus_rewards' | 'starlight_compass';
 
@@ -11,6 +31,7 @@ export type PaceZone = 'rising' | 'peak' | 'easing';
 export interface LanternColorDef {
   id: LanternColorId;
   name: string;
+  powerType: PowerType;
   powerName: string;
   powerSummary: string;
   cost: number;
@@ -19,16 +40,13 @@ export interface LanternColorDef {
   glowRgba: string;
   trimColor: string;
   accentHex: string;
-  hasMagnet: boolean;
+  /** Active power duration in seconds (0 for starter with no active power). */
+  powerDurationSec: number;
+  /** Recharge cooldown in seconds after active duration finishes. */
+  powerCooldownSec: number;
   magnetRadius: number;
   magnetStrength: number;
-  hasShield: boolean;
-  shieldCooldownSec: number;
-  hasGhost: boolean;
-  ghostDurationSec: number;
-  ghostCooldownSec: number;
   speedBonus: number;
-  streakBonusEvery: number;
 }
 
 export interface HelperDef {
@@ -69,6 +87,18 @@ export interface FallingLantern {
   fadeOut: number;
 }
 
+export interface CandleProjectile {
+  id: number;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  radius: number;
+  life: number;
+  maxLife: number;
+  style: 'candle' | 'starlight';
+}
+
 export interface HudSnapshot {
   phase: GamePhase;
   level: number;
@@ -84,11 +114,10 @@ export interface HudSnapshot {
   paceZone: PaceZone;
   speedMultiplier: number;
   equippedColor: LanternColorId;
-  shieldReady: boolean;
-  shieldCharge01: number;
-  ghostActive: boolean;
-  ghostReady: boolean;
-  ghostCharge01: number;
+  powerState: PowerState;
+  powerRemainingSec: number;
+  powerDurationSec: number;
+  powerCharge01: number;
   muted: boolean;
 }
 

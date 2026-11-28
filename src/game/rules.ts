@@ -2,13 +2,16 @@ import { LANTERN_COLOR_MAP, SHOP_HELPER_MAP } from './catalog';
 import type {
   HelperId,
   LanternColorId,
+  LanternKind,
   PaceZone,
   PersistentProgress,
+  PowerState,
 } from './types';
 
 export const BASE_STARTING_HEARTS = 3;
 export const ABSOLUTE_MAX_HEARTS = 6;
 export const STORAGE_KEY = 'lantern_lane_progress_v1';
+export const TIME_SLOW_FACTOR = 0.45;
 
 export function createDefaultProgress(): PersistentProgress {
   return {
@@ -81,6 +84,42 @@ export function getStartingHearts(progress: PersistentProgress): number {
   return Math.min(ABSOLUTE_MAX_HEARTS, BASE_STARTING_HEARTS + (progress.helpers.extra_heart || 0));
 }
 
+/**
+ * Compute vertical flight bounds strictly within the lower half of the viewport.
+ */
+export function getPlayerVerticalBounds(
+  viewportHeight: number,
+  playerRadius: number
+): { minY: number; maxY: number } {
+  const safeH = Math.max(320, viewportHeight);
+  const minY = Math.round(safeH * 0.5 + playerRadius + 4);
+  const maxY = Math.max(minY + 24, Math.round(safeH - Math.max(46, playerRadius + 24)));
+  return { minY, maxY };
+}
+
+export function clampPlayerPosition(
+  x: number,
+  y: number,
+  laneLeft: number,
+  laneRight: number,
+  viewportHeight: number,
+  playerRadius: number
+): { x: number; y: number } {
+  const minX = laneLeft + playerRadius + 8;
+  const maxX = Math.max(minX, laneRight - playerRadius - 8);
+  const { minY, maxY } = getPlayerVerticalBounds(viewportHeight, playerRadius);
+  return {
+    x: Math.max(minX, Math.min(maxX, x)),
+    y: Math.max(minY, Math.min(maxY, y)),
+  };
+}
+
+export function normalizeMoveVector(dx: number, dy: number): { x: number; y: number } {
+  const len = Math.hypot(dx, dy);
+  if (len <= 0.0001) return { x: 0, y: 0 };
+  return { x: dx / len, y: dy / len };
+}
+
 export function getLevelDurationSec(level: number): number {
   const safeLevel = Math.max(1, Math.floor(level));
   return Math.min(48, 26 + (safeLevel - 1) * 3.5);
@@ -99,7 +138,6 @@ export function getLevelSpeedMultiplier(
   const p = Math.max(0, Math.min(1, progress01));
   const levelScale = 1 + (safeLevel - 1) * 0.13;
 
-  // Starts brisk (1.12), swells via bell curve at midpoint (0.5 -> +0.62 peak), eases down at end (0.86)
   const startSpeed = 1.12;
   const endSpeed = 0.86;
   const linearDrift = startSpeed + (endSpeed - startSpeed) * p;
@@ -109,6 +147,48 @@ export function getLevelSpeedMultiplier(
   const peakBoost = 0.66 * bell * compassDamp;
 
   return Number((levelScale * (linearDrift + peakBoost)).toFixed(4));
+}
+
+export function getEffectiveFallSpeedMultiplier(
+  baseSpeedMult: number,
+  timeSlowActive: boolean
+): number {
+  return Number((baseSpeedMult * (timeSlowActive ? TIME_SLOW_FACTOR : 1)).toFixed(4));
+}
+
+/**
+ * Maps live speed multiplier (~0.85 calm finish up to ~2.1+ high-level peak surge)
+ * into a clamped [0, 1] nebula transition intensity.
+ */
+export function getNebulaIntensityForSpeed(speedMultiplier: number): number {
+  const minSpeed = 0.88;
+  const maxSpeed = 2.05;
+  const normalized = (speedMultiplier - minSpeed) / (maxSpeed - minSpeed);
+  return Math.max(0, Math.min(1, Number(normalized.toFixed(4))));
+}
+
+/**
+ * Splits normalized nebula intensity [0, 1] into smooth cross-fade weights across
+ * three pre-rendered space nebula palettes: calm (0), mid-surge (0.5), and peak (1).
+ */
+export function getNebulaLayerWeights(intensity: number): {
+  calm: number;
+  mid: number;
+  peak: number;
+} {
+  const t = Math.max(0, Math.min(1, intensity));
+  if (t <= 0.5) {
+    const mid = t * 2;
+    return { calm: Number((1 - mid).toFixed(4)), mid: Number(mid.toFixed(4)), peak: 0 };
+  }
+  const peak = (t - 0.5) * 2;
+  return { calm: 0, mid: Number((1 - peak).toFixed(4)), peak: Number(peak.toFixed(4)) };
+}
+
+export function stepNebulaIntensity(current: number, target: number, dt: number): number {
+  const safeDt = Math.max(0, Math.min(0.1, dt));
+  const next = current + (target - current) * Math.min(1, safeDt * 2.6);
+  return Math.max(0, Math.min(1, next));
 }
 
 export function getPaceZone(progress01: number): PaceZone {
@@ -134,18 +214,105 @@ export function getPurpleRatio(level: number, progress01: number): number {
   return Math.min(0.54, base + midSurge);
 }
 
+/**
+ * Duration-limited power timer machine for all earned lantern colors.
+ */
+export interface PowerTimerSnapshot {
+  state: PowerState;
+  activeRemaining: number;
+  cooldownRemaining: number;
+  charge01: number;
+}
+
+export function createInitialPowerTimer(colorId: LanternColorId): PowerTimerSnapshot {
+  const def = LANTERN_COLOR_MAP[colorId];
+  if (!def || def.powerType === 'none' || def.powerDurationSec <= 0) {
+    return { state: 'none', activeRemaining: 0, cooldownRemaining: 0, charge01: 0 };
+  }
+  return { state: 'ready', activeRemaining: 0, cooldownRemaining: 0, charge01: 1 };
+}
+
+export function activatePowerTimer(
+  current: PowerTimerSnapshot,
+  colorId: LanternColorId
+): { activated: boolean; next: PowerTimerSnapshot } {
+  const def = LANTERN_COLOR_MAP[colorId];
+  if (!def || def.powerType === 'none' || def.powerDurationSec <= 0) {
+    return { activated: false, next: current };
+  }
+  if (current.state !== 'ready') {
+    return { activated: false, next: current };
+  }
+  return {
+    activated: true,
+    next: {
+      state: 'active',
+      activeRemaining: def.powerDurationSec,
+      cooldownRemaining: 0,
+      charge01: 1,
+    },
+  };
+}
+
+export function tickPowerTimer(
+  current: PowerTimerSnapshot,
+  colorId: LanternColorId,
+  dt: number
+): PowerTimerSnapshot {
+  const def = LANTERN_COLOR_MAP[colorId];
+  if (!def || def.powerType === 'none' || def.powerDurationSec <= 0) {
+    return { state: 'none', activeRemaining: 0, cooldownRemaining: 0, charge01: 0 };
+  }
+  const safeDt = Math.max(0, dt);
+
+  if (current.state === 'active') {
+    const remaining = current.activeRemaining - safeDt;
+    if (remaining > 0) {
+      return {
+        state: 'active',
+        activeRemaining: remaining,
+        cooldownRemaining: 0,
+        charge01: Math.max(0, Math.min(1, remaining / def.powerDurationSec)),
+      };
+    }
+    const overflow = Math.abs(remaining);
+    const cd = Math.max(0, def.powerCooldownSec - overflow);
+    if (cd <= 0) {
+      return { state: 'ready', activeRemaining: 0, cooldownRemaining: 0, charge01: 1 };
+    }
+    return {
+      state: 'cooldown',
+      activeRemaining: 0,
+      cooldownRemaining: cd,
+      charge01: Math.max(0, Math.min(1, 1 - cd / def.powerCooldownSec)),
+    };
+  }
+
+  if (current.state === 'cooldown') {
+    const cd = Math.max(0, current.cooldownRemaining - safeDt);
+    if (cd <= 0) {
+      return { state: 'ready', activeRemaining: 0, cooldownRemaining: 0, charge01: 1 };
+    }
+    return {
+      state: 'cooldown',
+      activeRemaining: 0,
+      cooldownRemaining: cd,
+      charge01: Math.max(0, Math.min(1, 1 - cd / def.powerCooldownSec)),
+    };
+  }
+
+  return current;
+}
+
 export function getGoldValueForCatch(
   isRadiant: boolean,
   streakAfterCatch: number,
   bonusRewardsLevel: number,
-  equippedColor: LanternColorId
+  equippedColor: LanternColorId,
+  powerActive = false
 ): number {
   let value = isRadiant ? 3 : 1;
 
-  // Bonus Rewards helper:
-  // Lv 1: +1 extra gold every 3rd catch
-  // Lv 2: +1 extra gold every 2nd catch
-  // Lv 3: double gold on every catch!
   if (bonusRewardsLevel >= 3) {
     value *= 2;
   } else if (bonusRewardsLevel === 2 && streakAfterCatch % 2 === 0) {
@@ -154,10 +321,10 @@ export function getGoldValueForCatch(
     value += 1;
   }
 
-  // Crimson Comet power: +2 bonus gold every 5 consecutive catches
+  // Crimson Comet Surge doubles gold while active
   const colorDef = LANTERN_COLOR_MAP[equippedColor];
-  if (colorDef.streakBonusEvery > 0 && streakAfterCatch > 0 && streakAfterCatch % colorDef.streakBonusEvery === 0) {
-    value += 2;
+  if (colorDef.powerType === 'comet_surge' && powerActive) {
+    value *= 2;
   }
 
   return value;
@@ -186,13 +353,12 @@ export interface HazardCollisionInput {
   hearts: number;
   invulnerable: boolean;
   ghostActive: boolean;
-  shieldReady: boolean;
+  shieldActive: boolean;
 }
 
 export interface HazardCollisionResult {
   outcome: 'ignored' | 'ghost_phase' | 'shield_block' | 'damaged' | 'defeated';
   heartsAfter: number;
-  consumedShield: boolean;
 }
 
 export function resolvePurpleHit(input: HazardCollisionInput): HazardCollisionResult {
@@ -200,29 +366,37 @@ export function resolvePurpleHit(input: HazardCollisionInput): HazardCollisionRe
     return {
       outcome: 'ghost_phase',
       heartsAfter: input.hearts,
-      consumedShield: false,
+    };
+  }
+  if (input.shieldActive) {
+    return {
+      outcome: 'shield_block',
+      heartsAfter: input.hearts,
     };
   }
   if (input.invulnerable) {
     return {
       outcome: 'ignored',
       heartsAfter: input.hearts,
-      consumedShield: false,
-    };
-  }
-  if (input.shieldReady) {
-    return {
-      outcome: 'shield_block',
-      heartsAfter: input.hearts,
-      consumedShield: true,
     };
   }
   const nextHearts = Math.max(0, input.hearts - 1);
   return {
     outcome: nextHearts === 0 ? 'defeated' : 'damaged',
     heartsAfter: nextHearts,
-    consumedShield: false,
   };
+}
+
+export function resolveProjectileHit(
+  projectileStyle: 'candle' | 'starlight',
+  targetKind: LanternKind
+): 'catch_gold' | 'eliminate_purple' | 'ignore' {
+  const isGold = targetKind === 'gold' || targetKind === 'radiant';
+  if (isGold) {
+    return 'catch_gold';
+  }
+  // Candle shots eliminate purple obstacles; Starlight Net wisps focus purely on catching gold lanterns
+  return projectileStyle === 'candle' ? 'eliminate_purple' : 'ignore';
 }
 
 export function getHelperNextCost(id: HelperId, currentLevel: number): number | null {
@@ -319,7 +493,7 @@ export function computeMagnetPull(
   const force = strength * (0.35 + 0.65 * falloff);
   return {
     ax: (dx / dist) * force,
-    ay: (dy / dist) * force * 0.55,
+    ay: (dy / dist) * force * 0.7,
     active: true,
   };
 }

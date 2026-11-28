@@ -3,6 +3,7 @@ import { GameHud } from './components/GameHud';
 import { ShopModal } from './components/ShopModal';
 import { TitleOverlay } from './components/TitleOverlay';
 import { LanternAudio } from './game/audio';
+import { LANTERN_COLOR_MAP } from './game/catalog';
 import { LanternLaneEngine } from './game/engine';
 import {
   buyHelperUpgrade,
@@ -23,6 +24,8 @@ import type {
 
 function createInitialHud(progress: PersistentProgress): HudSnapshot {
   const startHearts = getStartingHearts(progress);
+  const colorDef = LANTERN_COLOR_MAP[progress.equippedColor];
+  const hasPower = colorDef.powerType !== 'none';
   return {
     phase: 'title',
     level: 1,
@@ -38,11 +41,10 @@ function createInitialHud(progress: PersistentProgress): HudSnapshot {
     paceZone: 'rising',
     speedMultiplier: 1.12,
     equippedColor: progress.equippedColor,
-    shieldReady: progress.equippedColor === 'emerald',
-    shieldCharge01: progress.equippedColor === 'emerald' ? 1 : 0,
-    ghostActive: false,
-    ghostReady: progress.equippedColor === 'pearl',
-    ghostCharge01: progress.equippedColor === 'pearl' ? 1 : 0,
+    powerState: hasPower ? 'ready' : 'none',
+    powerRemainingSec: 0,
+    powerDurationSec: colorDef.powerDurationSec,
+    powerCharge01: hasPower ? 1 : 0,
     muted: false,
   };
 }
@@ -170,8 +172,8 @@ export default function App() {
     engineRef.current?.toggleMute();
   }, []);
 
-  const handleTriggerGhost = useCallback(() => {
-    engineRef.current?.triggerGhostPower();
+  const handleTriggerPower = useCallback(() => {
+    engineRef.current?.triggerActivePower();
   }, []);
 
   const handleBuyOrEquipColor = useCallback(
@@ -211,7 +213,7 @@ export default function App() {
         <canvas
           ref={canvasRef}
           data-testid="lantern-canvas"
-          className="block w-full h-full cursor-ew-resize"
+          className="block w-full h-full cursor-move"
           aria-label="Lantern Lane game playfield"
         />
       </div>
@@ -237,7 +239,7 @@ export default function App() {
         onReturnTitle={handleReturnTitle}
         onOpenShop={() => setShopOpen(true)}
         onToggleMute={handleToggleMute}
-        onTriggerGhost={handleTriggerGhost}
+        onTriggerPower={handleTriggerPower}
       />
 
       {/* Lantern Shop Modal */}
